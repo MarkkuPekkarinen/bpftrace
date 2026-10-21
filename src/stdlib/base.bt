@@ -139,6 +139,8 @@ macro cgroup()
 //
 // **async**
 //
+// Use `delete(m)` to remove all keys/values synchronously.
+//
 // ```
 // interval:ms:100 {
 //   @[rand % 10] = count();
@@ -156,7 +158,8 @@ macro cgroup()
 // Returns a `Record` containing the current `bpftrace` configuration settings. [List of config variables](./language.md#config-variables)
 //
 // ```
-// printf("max_strlen: %d, stack_mode: %s\n", config.max_strlen, config.stack_mode);
+// begin {
+//   printf("max_strlen: %d, stack_mode: %s\n", config.max_strlen, config.stack_mode);
 // }
 // ```
 macro config()
@@ -249,9 +252,13 @@ macro curtask()
 
 // :summary Removes one key and its value from a map.
 // :variant bool delete(map m, mapkey k)
+// :variant bool delete(map m)
 // :deprecated_variant bool delete(mapkey k)
 //
-// For scalar maps (e.g. no explicit keys), the key is omitted and is equivalent to calling `clear`.
+// For scalar maps (e.g. no explicit keys), the key is omitted.
+// For maps with explicit keys, omitting the key deletes all of the map's keys/values and returns false if some entries couldn't be deleted.
+// Unlike `clear`, the deletion happens in-kernel during the call rather than asynchronously, so it can't be dropped. If other probes update the map at the same time (e.g. on other CPUs), entries they add while `delete` runs may remain afterwards.
+// Note that because the deletion happens in-kernel, a `print` of the map issued earlier in the same probe will also see an empty map, as printing happens asynchronously.
 // For map keys that are composed of multiple values (e.g. `@mymap[3, "hello"] = 1` - remember these values are represented as a tuple) the syntax would be: `delete(@mymap, (3, "hello"));`
 //
 // If deletion fails (e.g. the key doesn’t exist) the function returns false (0).
@@ -263,7 +270,7 @@ macro curtask()
 // delete(@a, 1); // no warning (the key exists)
 //
 // if (delete(@a, 2)) { // no warning (return value is used)
-//   ...
+//   // ...
 // }
 //
 // $did_delete = delete(@a, 2); // no warning (return value is used)
@@ -282,12 +289,12 @@ macro curtask()
 //   delete(@single, "hello"); // ok
 //   @associative[1,2] = 1;
 //   delete(@associative, (1,2)); // ok
-//   delete(@associative); // error
+//   delete(@associative); // ok, deletes all keys/values
 //   delete(@associative, 1); // error
 //
-//     // deprecated but ok
-//     delete(@single["hello"]);
-//     delete(@associative[1, 2]);
+//   // deprecated but ok
+//   delete(@single["hello"]);
+//   delete(@associative[1, 2]);
 // }
 // ```
 macro delete(@map, $key)
@@ -309,10 +316,7 @@ macro delete(@map)
 {
   import "stdlib/map/map.bpf.c";
   if comptime (!is_scalar(@map)) {
-    fail(
-      "call to delete() with a single argument expects a map without explicit keys (scalar map)"
-    );
-    false
+    __delete_all((void*)(&@map))
   } else {
     let $key : int64 = 0;
     __delete((void*)(&@map), (void*)(&$key)) == 0
@@ -348,7 +352,7 @@ macro elapsed()
 // Prints:
 //
 // ```
-// EXPECT stdin:1:9-62: ERROR: Something bad with args: 10, arg2
+// stdin:1:9-62: ERROR: Something bad with args: 10, arg2
 // ```
 
 // :summary Terminates bpftrace with an optional exit code.
@@ -478,10 +482,10 @@ macro gid()
 //     print(("bye"));
 //   }
 //
-//     @scalar = 1;
-//     if (has_key(@scalar)) { // error
-//       print(("hello"));
-//     }
+//   @scalar = 1;
+//   if (has_key(@scalar)) { // error
+//     print(("hello"));
+//   }
 // }
 // ```
 macro has_key(@map, key)
@@ -894,7 +898,7 @@ macro write_user(dst, src, len)
 // ```
 // interval:s:1 {
 //   $proc_cnt = percpu_kaddr("process_counts");
-//   printf("% processes are running on CPU %d\n", *$proc_cnt, cpu);
+//   printf("%d processes are running on CPU %d\n", *$proc_cnt, cpu);
 // }
 // ```
 //
@@ -991,14 +995,11 @@ macro leader_comm()
 // :summary Prints a value using its default formatting.
 // :function print
 // :variant void print(T val)
+// :variant void print(@map [, uint64 top [, uint64 div]])
 //
 // **async**
-// :variant void print(T val)
-// :variant void print(@map)
-// :variant void print(@map, uint64 top)
-// :variant void print(@map, uint64 top, uint64 div)
 //
-// `print` prints a the value, which can be a map or a scalar value, with the default formatting for the type.
+// `print` prints a value, which can be a map or a scalar value, with the default formatting for the type.
 //
 // ```
 // interval:s:1 {
@@ -1048,11 +1049,11 @@ macro leader_comm()
 // BEGIN {
 //   $i = 11;
 //   for $elem : 1..$i {
-//     @[$elem] = $elem-1;
+//     @[$elem] = $elem - 1;
 //   }
 //   print(@, 2);
 //   clear(@);
-//   exit()
+//   exit();
 // }
 //
 // /*
@@ -1068,21 +1069,22 @@ macro leader_comm()
 //
 // ```
 // kprobe:f {
-//   @[func] += arg0/10;
+//   @[func] += arg0 / 10;
 // }
 // ```
 //
 // With the following sequence as numbers for arg0: `134, 377, 111, 99`.
 // The total is `721` which rounds to `72` when scaled by 10 but the program would print `70` due to the rounding of individual values.
 //
-// Changing the print call to `print(@, 5, 2)` will take the top 5 values and scale them by 2:
+// Changing the earlier `print(@, 2)` call to `print(@, 5, 2)` will take the top 5
+// values and scale them by 2:
 //
 // ```
-// @[6]: 3
+// @[6]: 2
 // @[7]: 3
-// @[8]: 4
+// @[8]: 3
 // @[9]: 4
-// @[10]: 5
+// @[10]: 4
 // ```
 
 // :summary Prints arguments using a format string.
@@ -1456,7 +1458,7 @@ macro signal_thread(expr)
 //
 // ```
 // tracepoint:syscalls:sys_enter_execve {
-//   system("/bin/grep %s /proc/%d/status", "vmswap", pid);
+//   system("/bin/grep %s /proc/%d/status", "VmSwap", pid);
 // }
 // ```
 
@@ -1739,7 +1741,7 @@ macro dw_ustack()
 //
 // **async**
 //
-// `warnf()` formats and prints data (similar to [`printf`](#printf)) as an warning message with the source location. This respects the "--no-warnings" flag and will be silent if that is used.
+// `warnf()` formats and prints data (similar to [`printf`](#printf)) as a warning message with the source location. This respects the "--no-warnings" flag and will be silent if that is used.
 //
 // ```
 // BEGIN { warnf("Something kinda bad with args: %d, %s", 10, "arg2"); }
@@ -1748,5 +1750,5 @@ macro dw_ustack()
 // Prints:
 //
 // ```
-// EXPECT stdin:1:9-62: WARNING: Something kinda bad with args: 10, arg2
+// stdin:1:9-67: WARNING: Something kinda bad with args: 10, arg2
 // ```
